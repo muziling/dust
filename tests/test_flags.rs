@@ -64,6 +64,7 @@ pub fn test_d_flag_works_and_still_recurses_down() {
     // We had a bug where running with '-d 1' would stop at the first directory and the code
     // would fail to recurse down
     let output = build_command(vec!["-d", "1", "-f", "-c", "tests/test_dir2/"]);
+    assert!(output.contains("1   ┌── dir"));
     assert!(output.contains("4 ┌─┴ test_dir2"));
 }
 
@@ -73,14 +74,25 @@ pub fn test_ignore_dir() {
     let output = build_command(vec!["-c", "-X", "dir_substring", "tests/test_dir2/"]);
     assert!(!output.contains("dir_substring"));
 }
-// Add test for multiple dirs - with -d 0 and maybe -d 1 check the
+
+#[test]
+pub fn test_ignore_all_in_file() {
+    let output = build_command(vec![
+        "-c",
+        "-I",
+        "tests/test_dir_hidden_entries/.hidden_file",
+        "tests/test_dir_hidden_entries/",
+    ]);
+    assert!(output.contains(" test_dir_hidden_entries"));
+    assert!(!output.contains(".secret"));
+}
 
 #[test]
 pub fn test_with_bad_param() {
     let mut cmd = Command::cargo_bin("dust").unwrap();
     let result = cmd.arg("bad_place").unwrap();
     let stderr = str::from_utf8(&result.stderr).unwrap();
-    assert!(stderr.contains("Did not have permissions for all directories"));
+    assert!(stderr.contains("No such file or directory"));
 }
 
 #[test]

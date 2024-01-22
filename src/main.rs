@@ -11,24 +11,26 @@ mod progress;
 mod utils;
 
 use crate::cli::build_cli;
+use crate::progress::RuntimeErrors;
+use clap::parser::ValuesRef;
 use dir_walker::WalkData;
 use display::InitialDisplayData;
 use filter::AggregateData;
 use progress::PIndicator;
-use progress::ORDERING;
+use regex::Error;
 use std::collections::HashSet;
-use std::io::BufRead;
+use std::fs::read_to_string;
 use std::panic;
 use std::process;
+use std::sync::Arc;
+use std::sync::Mutex;
 use sysinfo::{System, SystemExt};
 
 use self::display::draw_it;
-use clap::Values;
 use config::get_config;
 use dir_walker::walk_it;
 use filter::get_biggest;
 use filter_type::get_all_file_types;
-use rayon::ThreadPoolBuildError;
 use regex::Regex;
 use std::cmp::max;
 use std::path::PathBuf;
@@ -87,7 +89,7 @@ fn get_width_of_terminal() -> usize {
         .unwrap_or(DEFAULT_TERMINAL_WIDTH)
 }
 
-fn get_regex_value(maybe_value: Option<Values>) -> Vec<Regex> {
+fn get_regex_value(maybe_value: Option<ValuesRef<String>>) -> Vec<Regex> {
     maybe_value
         .unwrap_or_default()
         .map(|reg| {
@@ -99,67 +101,72 @@ fn get_regex_value(maybe_value: Option<Values>) -> Vec<Regex> {
         .collect()
 }
 
-// Returns a list of lines from stdin or `None` if there's nothing to read
-fn get_lines_from_stdin() -> Option<Vec<String>> {
-    atty::isnt(atty::Stream::Stdin).then(|| {
-        std::io::stdin()
-            .lock()
-            .lines()
-            .collect::<Result<_, _>>()
-            .expect("Error reading from stdin")
-    })
-}
-
 fn main() {
     let options = build_cli().get_matches();
     let config = get_config();
-    let stdin_lines = get_lines_from_stdin();
 
-    let target_dirs = match options.values_of("inputs") {
-        Some(values) => values.collect(),
-        None => stdin_lines.as_ref().map_or(vec!["."], |lines| {
-            lines.iter().map(String::as_str).collect()
-        }),
+    let target_dirs = match options.get_many::<String>("params") {
+        Some(values) => values.map(|v| v.as_str()).collect::<Vec<&str>>(),
+        None => vec!["."],
     };
 
-    let summarize_file_types = options.is_present("types");
+    let summarize_file_types = options.get_flag("types");
 
-    let filter_regexs = get_regex_value(options.values_of("filter"));
-    let invert_filter_regexs = get_regex_value(options.values_of("invert_filter"));
+    let filter_regexs = get_regex_value(options.get_many("filter"));
+    let invert_filter_regexs = get_regex_value(options.get_many("invert_filter"));
 
-    let terminal_width = options
-        .value_of_t("width")
-        .unwrap_or_else(|_| get_width_of_terminal());
+    let terminal_width: usize = match options.get_one::<usize>("width") {
+        Some(&val) => val,
+        None => get_width_of_terminal(),
+    };
 
     let depth = config.get_depth(&options);
 
     // If depth is set, then we set the default number_of_lines to be max
     // instead of screen height
-    let default_height = if depth != usize::MAX {
-        usize::MAX
-    } else {
-        get_height_of_terminal()
-    };
 
-    let number_of_lines = options
-        .value_of("number_of_lines")
-        .and_then(|v| {
-            v.parse()
-                .map_err(|_| eprintln!("Ignoring bad value for number_of_lines"))
-                .ok()
-        })
-        .unwrap_or(default_height);
+    let number_of_lines = match options.get_one::<usize>("number_of_lines") {
+        Some(&val) => val,
+        None => {
+            if depth != usize::MAX {
+                usize::MAX
+            } else {
+                get_height_of_terminal()
+            }
+        }
+    };
 
     let no_colors = init_color(config.get_no_colors(&options));
 
-    let ignore_directories = options
-        .values_of("ignore_directory")
-        .unwrap_or_default()
-        .map(PathBuf::from);
+    let ignore_directories = match options.get_many::<String>("ignore_directory") {
+        Some(values) => values
+            .map(|v| v.as_str())
+            .map(PathBuf::from)
+            .collect::<Vec<PathBuf>>(),
+        None => vec![],
+    };
 
-    let by_filecount = options.is_present("by_filecount");
-    let limit_filesystem = options.is_present("limit_filesystem");
-    let follow_links = options.is_present("dereference_links");
+    let ignore_from_file_result = match options.get_one::<String>("ignore_all_in_file") {
+        Some(val) => read_to_string(val)
+            .unwrap()
+            .lines()
+            .map(Regex::new)
+            .collect::<Vec<Result<Regex, Error>>>(),
+        None => vec![],
+    };
+    let ignore_from_file = ignore_from_file_result
+        .into_iter()
+        .filter_map(|x| x.ok())
+        .collect::<Vec<Regex>>();
+
+    let invert_filter_regexs = invert_filter_regexs
+        .into_iter()
+        .chain(ignore_from_file)
+        .collect::<Vec<Regex>>();
+
+    let by_filecount = options.get_flag("by_filecount");
+    let limit_filesystem = options.get_flag("limit_filesystem");
+    let follow_links = options.get_flag("dereference_links");
 
     let simplified_dirs = simplify_dir_names(target_dirs);
     let allowed_filesystems = limit_filesystem
@@ -167,6 +174,7 @@ fn main() {
         .unwrap_or_default();
 
     let ignored_full_path: HashSet<PathBuf> = ignore_directories
+        .into_iter()
         .flat_map(|x| simplified_dirs.iter().map(move |d| d.join(&x)))
         .collect();
 
@@ -189,14 +197,12 @@ fn main() {
         ignore_hidden,
         follow_links,
         progress_data: indicator.data.clone(),
+        errors: Arc::new(Mutex::new(RuntimeErrors::default())),
     };
+    let stack_size = config.get_custom_stack_size(&options);
+    init_rayon(&stack_size);
 
-    let result = panic::catch_unwind(|| init_rayon);
-    if result.is_err() {
-        eprintln!("Problem initializing rayon, try: export RAYON_NUM_THREADS=1")
-    }
-
-    let top_level_nodes = walk_it(simplified_dirs, walk_data);
+    let top_level_nodes = walk_it(simplified_dirs, &walk_data);
 
     let tree = match summarize_file_types {
         true => get_all_file_types(&top_level_nodes, number_of_lines),
@@ -207,18 +213,37 @@ fn main() {
                 only_file: config.get_only_file(&options),
                 number_of_lines,
                 depth,
-                using_a_filter: options.values_of("filter").is_some()
-                    || options.value_of("invert_filter").is_some(),
+                using_a_filter: !filter_regexs.is_empty() || !invert_filter_regexs.is_empty(),
             };
             get_biggest(top_level_nodes, agg_data)
         }
     };
 
-    let failed_permissions = indicator.data.no_permissions.load(ORDERING);
-    indicator.stop();
     // Must have stopped indicator before we print to stderr
+    indicator.stop();
+
+    let final_errors = walk_data.errors.lock().unwrap();
+    let failed_permissions = final_errors.no_permissions;
+    if !final_errors.file_not_found.is_empty() {
+        let err = final_errors
+            .file_not_found
+            .iter()
+            .map(|a| a.as_ref())
+            .collect::<Vec<&str>>()
+            .join(", ");
+        eprintln!("No such file or directory: {}", err);
+    }
     if failed_permissions {
         eprintln!("Did not have permissions for all directories");
+    }
+    if !final_errors.unknown_error.is_empty() {
+        let err = final_errors
+            .unknown_error
+            .iter()
+            .map(|a| a.as_ref())
+            .collect::<Vec<&str>>()
+            .join(", ");
+        eprintln!("Unknown Error: {}", err);
     }
 
     if let Some(root_node) = tree {
@@ -229,6 +254,7 @@ fn main() {
             by_filecount,
             iso,
             is_screen_reader: config.get_screen_reader(&options),
+            bars_on_right: config.get_bars_on_right(&options),
         };
         draw_it(
             idd,
@@ -240,18 +266,34 @@ fn main() {
     }
 }
 
-fn init_rayon() -> Result<(), ThreadPoolBuildError> {
-    let large_stack = usize::pow(1024, 3);
-    let mut s = System::new();
-    s.refresh_memory();
-    let available = s.available_memory();
+fn init_rayon(stack_size: &Option<usize>) {
+    // Rayon seems to raise this error on 32-bit builds
+    // The global thread pool has not been initialized.: ThreadPoolBuildError { kind: GlobalPoolAlreadyInitialized }
+    if cfg!(target_pointer_width = "64") {
+        let result = panic::catch_unwind(|| {
+            match stack_size {
+                Some(n) => rayon::ThreadPoolBuilder::new()
+                    .stack_size(*n)
+                    .build_global(),
+                None => {
+                    let large_stack = usize::pow(1024, 3);
+                    let mut s = System::new();
+                    s.refresh_memory();
+                    let available = s.available_memory();
 
-    if available > large_stack.try_into().unwrap() {
-        // Larger stack size to handle cases with lots of nested directories
-        rayon::ThreadPoolBuilder::new()
-            .stack_size(large_stack)
-            .build_global()
-    } else {
-        rayon::ThreadPoolBuilder::new().build_global()
+                    if available > large_stack.try_into().unwrap() {
+                        // Larger stack size to handle cases with lots of nested directories
+                        rayon::ThreadPoolBuilder::new()
+                            .stack_size(large_stack)
+                            .build_global()
+                    } else {
+                        rayon::ThreadPoolBuilder::new().build_global()
+                    }
+                }
+            }
+        });
+        if result.is_err() {
+            eprintln!("Problem initializing rayon, try: export RAYON_NUM_THREADS=1")
+        }
     }
 }
